@@ -1,0 +1,399 @@
+---
+title: "105.708 Data Acquisition and Survey Methods : Assignment 1"
+subtitle: "Eugene Tomilin (12533692)"
+output:
+  pdf_document:
+    toc: true
+---
+
+# 1. Init
+
+> Find a city that starts with the same letter as your first name on <https://www.timeanddate.com/weather/>.\
+> Only use cities that have both weather and climate tables available.
+
+I've chosen **Edinburgh**.
+
+Though this primitive should have worked:
+
+```         
+URL <- "https://www.timeanddate.com/weather/uk/edinburgh" 
+html <- read_html(url) It does not .
+```
+
+It hasn't. Proposed URL www.timeanddate.com has Cloudflare protection which negates automated scrapping attempts.
+
+I've played with execution flags in headless mode for chromium in hope for --dump-dom, but without success. Don't think that bypassing cloudflare protection is part of the task.\
+Thus only minimum viable option remain is to run browser instance as human would do it and attch debugger to dump DOM.\
+To emulate real user *getBrowserData* was implemented (see 1.2) which does exactly this:
+
+-   starts Chrome,
+-   websockets to debug port,
+-   dumps html.
+
+There are no polls to simplify, only lags after calls to ensure asynch loading/processing time. Constants might require adjustments on slower PCs.
+
+## 1.1 Library loader
+
+```{r}
+if (!requireNamespace("jsonlite", quietly = TRUE)) install.packages("jsonlite")
+if (!requireNamespace("websocket", quietly = TRUE)) install.packages("websocket")
+if (!requireNamespace("rvest", quietly = TRUE)) install.packages("rvest")
+if (!requireNamespace("xml2", quietly = TRUE)) install.packages("xml2")
+if (!requireNamespace("knitr", quietly = TRUE)) install.packages("knitr")
+
+library(jsonlite)
+library(websocket)
+library(rvest)
+library(xml2)
+library(knitr)
+
+```
+
+## 1.2 Browser helper
+
+```{r bro_help}
+getBrowserData <- function(URL, dump = FALSE) {
+  # shell string , this applies to mac + Chrome (Safari/others won’t support DevTools in this way)
+  chrome <- "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  
+  # random port for local debugging 
+  port <- sample(10000:20000, 1)
+  
+  # temp profile allows safe cleanup (we kill all processes using it later)
+  profile <- tempfile("chrome-profile-")
+  
+  # launch
+  pid <- system2(
+    chrome,
+    args = c(
+      paste0("--remote-debugging-port=", port), # expose DevTools on port
+      paste0("--user-data-dir=", profile),      # isolate session
+      "--no-first-run",                         # suppress startup prompts
+      "--no-default-browser-check",
+      "--new-window",
+      URL
+    ), wait = FALSE)
+  
+  # wait for page to load before attaching DevTools
+  Sys.sleep(5)
+  
+  # construct DevTools websocket URL
+  targets <- jsonlite::fromJSON(paste0("http://127.0.0.1:", port, "/json"))
+  
+  # ensure we bind to correct page target (exact URL match)
+  ws_url <- targets$webSocketDebuggerUrl[targets$type == "page" & targets$url == URL][1]
+  
+  # sanity check
+  if (is.na(ws_url) || !nzchar(ws_url)) stop("No DevTools page target")
+  
+  # websocket to get to browser
+  ws <- websocket::WebSocket$new(ws_url)
+  
+  # wait until websocket is OPEN
+  for (i in 1:50) {                # ~5 sec max
+    later::run_now(timeout = 0.1)  #give a chance to refresh state
+   if (ws$readyState() == 1) break }
+  
+  # flush output
+  html_value <- NULL
+  
+  # callback binder (websocket is async)
+  ws$onMessage(function(event) {
+    msg <- jsonlite::fromJSON(event$data)
+    
+    # filter only our request (id = 1), ignore other traffic
+    if (!is.null(msg$id) && msg$id == 1) {
+      html_value <<- msg$result$result$value}})
+  
+  # request full HTML from browser
+  ws$send(jsonlite::toJSON(list(
+    id = 1,  # request id, used in callback filter
+    method = "Runtime.evaluate",
+    params = list(expression = "document.documentElement.outerHTML")
+  ), auto_unbox = TRUE))
+  
+  # give time to execute before closing socket
+  for (i in 1:50) {   # 50 * 0.1 = 5 sec max
+    later::run_now(timeout = 0.1)    # allow socket events 
+    if (!is.null(html_value)) break}
+  
+  # cleanup
+  ws$close() 
+  system2("pkill", c("-f", profile))  # kill Chrome instances tied to temp profile
+  
+  # optional dump to disk
+  if (dump) { fname <- sub(".*/", "", URL)
+    if (!nzchar(fname)) fname <- "index"
+    writeLines(html_value, paste0(fname, ".html"))}
+  
+  # return parsed HTML
+  return(xml2::read_html(html_value))}
+```
+
+## 1. Print helper
+
+This is data frame wrapper for pretty printing in PDF, so all tables look alike.
+
+```{r print_help}
+toReportTable <- function(df, caption = NULL) {
+  knitr::kable(
+    df,
+    caption = caption,
+    align = paste(rep("l", ncol(df)), collapse = "")
+  )
+}
+```
+
+# 2. 48h forecast
+
+> Retrieve the data from the summary table „Forecast for the next 48 hours“. (Weather symbols can be ignored.) Output a table that summarizes this information. (Edit to clarify: "summarize" might be misleading here, the table should contain the information you scraped.)
+
+Direct observation in browser debugger revealed following :
+
+-   anchor tag for table has unique id \<table id="wt-48" ....\>
+-   column names are combined under //thead, and aligned on colspan ( I concat names using dash )
+-   rows hold labels under /th . all except one blank which is skipped
+-   weekdays has 'bg-wt' id
+
+Thus I reconstruct periods as rows and iterate on attribute values for columns.\
+I don't wanted to split strings , so used simple regexp to tear out only numbers.
+
+## Fetch
+
+```{r , echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+url <- "https://www.timeanddate.com/weather/uk/edinburgh"
+html <- getBrowserData(url, FALSE)
+```
+
+## Parse
+
+```{r}
+# root node
+node_48 <- html_element(html, xpath = "//table[@id='wt-48']")
+
+# extract headers
+day_nodes  <- html_elements(node_48, xpath = ".//thead//tr[contains(@class,'bg-wt')]//th")
+part_nodes <- html_elements(node_48, xpath = ".//thead//tr[2]//th")
+#reconstruct days array
+days <- unlist(lapply(day_nodes, function(n) {
+  label <- html_text2(n)
+  span  <- html_attr(n, "colspan")
+  span  <- ifelse(is.na(span), 1, as.integer(span))
+  rep(label, span)
+}))
+# direct extract dayparts
+parts <- html_text2(part_nodes)
+# cut first column , it contains row labels
+days  <- days[-1]
+parts <- parts[-1]
+# merge day-daypart 
+time <- paste(days, parts, sep = "-")
+# extract rows
+rows <- html_elements(node_48, xpath = ".//tbody//tr")
+# helper to convert to num
+clean_num <- function(x) as.numeric(gsub("[^0-9.-]", "", x))
+# temp container for dataframe 
+data_list <- list()
+# build list
+for (r in rows) {
+  label <- html_text2(html_element(r, "th"))
+  values <- html_text2(html_elements(r, "td"))
+    if (label == "" || is.na(label)) next  # skip sky icons
+  data_list[[label]] <- values}
+
+# wrap to dataframe for nice print
+t48 <- data.frame(time = time, stringsAsFactors = FALSE)
+
+for (name in names(data_list)) {
+num <- suppressWarnings(clean_num(data_list[[name]]))
+t48[[name]] <- if (all(is.na(num))) data_list[[name]] else num 
+}
+
+# remove strange symbols in wind dir 
+t48$`Wind Direction` <- gsub("[^A-Z]", "", t48$`Wind Direction`)
+
+#transponce there are more columns then rows 
+t48 <- as.data.frame(t(t48))
+# copy to col labels & drop 1st row 
+colnames(t48) <- as.character(t48[1, ])
+t48 <- t48[-1, ]
+
+toReportTable(t48, caption = "48h summary")
+
+
+```
+
+# 3. 24h forecast
+
+> Visualize the predicted development of temperature, wind, and humidity for the next 24 hours (retrieve the data from „Detailed Hourly Forecast - Next 24 hours“). Date & times should be formatted nicely.
+
+New URL <https://www.timeanddate.com/weather/uk/edinburgh/hourly>
+
+Observations from chrome debugger:
+
+-   24h table has exact id ="wt-14d"
+-   provided reference sample is a hourly temperature line chart , it has huge depth , but task limits to 24h
+-   playing with filters and looking to http responses revealed that hourly data is already there. Nothing is requested on filter change. Indeed it was found as json, so no need to traverse html.
+-   used parent class + code block + starting string as anchor to get json
+
+## 3.Fetch
+
+```{r , echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+url <- "https://www.timeanddate.com/weather/uk/edinburgh/hourly"
+html_h <- getBrowserData (url , FALSE)
+```
+
+## 3.Parse&plot
+
+Observation revealed that all the data is placed to script block under \*headline-banner\_\_wrap\* in json for smooth scrolling. I need to just parse json and plot.
+
+```{r}
+
+# selector
+script_node <- xml2::xml_find_first(
+  html_h,
+  "//section[contains(@class,'headline-banner__wrap')]//script[contains(.,'var data=')]"
+)
+
+script <- xml2::xml_text(script_node)
+
+# get JSON
+start <- regexpr("var data=", script)[1] + nchar("var data=")
+end   <- regexpr("};", script)[1]
+json_txt <- substr(script, start, end)
+
+data <- jsonlite::fromJSON(json_txt)
+
+df <- data$detail[, c("ts","temp","wind","hum","hls")]
+colnames(df) <- c("time","temperature","wind","humidity","dateLabel")
+
+df <- df[1:24, ]
+
+date_txt <- df$dateLabel[which(!is.na(df$dateLabel))[1]]
+
+# add spacing , too dense 
+x <- seq(1, by = 2, length.out = nrow(df))
+y <- df$temperature
+
+plot(
+  x, y,
+  type = "o",
+  pch = 16,
+  xaxt = "n",
+  xlim = c(min(x) - 1, max(x) + 1),
+  ylim = c(min(y), max(y) + 4),
+  xlab = "Time",
+  ylab = "Temperature",
+  main = date_txt
+)
+
+axis(1, at = x, labels = df$time)
+
+# smaller labels, overlaps
+text(x, y + 2.4,
+     labels = paste0(round(df$temperature,1), "°C"),
+     cex = 0.45, font = 2)
+
+text(x, y + 1.6,
+     labels = paste0(df$wind, " km/h"),
+     cex = 0.4)
+
+text(x, y + 0.8,
+     labels = paste0(df$humidity, "%"),
+     cex = 0.4, col = "gray50")
+```
+
+# 4. Climate table
+
+> Retrieve the monthly annual weather averages from „Climate (Averages) - Annual Weather Averages“. Tip: It might be easier to use the climate table object (id: climateTable) than the graph to retrieve the information. Get the following summary statistics: - annual minimum, maximum, and mean temperature - annual mean precipitation Output a table and a plot for the monthly values (Edit to clarify: of the variables you analyzed in the point above).
+
+Same approach as in (3) , it turned out that json is present that holds the data. Parent is
+
+<article class="layout-grid__main tpl-banner__content">
+
+. Xpath'ed by parent + script + starting string
+
+## 4. Fetch
+
+```{r, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+url_climate <- "https://www.timeanddate.com/weather/uk/edinburgh/climate"
+html_a <- getBrowserData(url_climate, FALSE)
+```
+
+## 4. Calc
+
+```{r}
+# locate script under article containing "var data="
+script_node <- html_a |>
+  rvest::html_element(xpath = "//article[contains(@class,'layout-grid__main')]//script[contains(.,'var data=')]")
+
+script_text <- rvest::html_text(script_node)
+
+# strip prefix and trailing semicolon + newline
+json_txt <- sub("^\\s*var data=", "", script_text)
+json_txt <- sub(";\\s*$", "", json_txt)
+
+# parse JSON
+climate_json <- jsonlite::fromJSON(json_txt)
+
+# monthly data
+df <- climate_json$months
+
+# summary statistics 
+annual_min_temp  <- min(df$min)
+annual_max_temp  <- max(df$max)
+annual_mean_temp <- mean(df$mean)
+annual_mean_prec <- mean(df$prec)
+
+summary_tbl <- data.frame(
+  metric = c("annual_min_temp", "annual_max_temp", "annual_mean_temp", "annual_mean_precip"),
+  value  = c(annual_min_temp, annual_max_temp, annual_mean_temp, annual_mean_prec)
+)
+
+toReportTable(summary_tbl, "climate metrics")
+```
+
+## 4. Plot and tables
+
+```{r}
+# monthly table (only variables used above)
+monthly_tbl <- data.frame(
+  month = df$name,
+  min   = df$min,
+  max   = df$max,
+  mean  = df$mean,
+  prec  = df$prec
+)
+
+toReportTable(monthly_tbl, "motntly values")
+
+# temperature plot (min / mean / max)
+matplot(
+  x = 1:nrow(monthly_tbl),
+  y = monthly_tbl[, c("min", "mean", "max")],
+  type = "l",
+  lty = 1,
+  xlab = "Month",
+  ylab = "Temperature (°C)",
+  xaxt = "n"
+)
+axis(1, at = 1:nrow(monthly_tbl), labels = monthly_tbl$month)
+
+# precipitation plot
+plot(
+  x = 1:nrow(monthly_tbl),
+  y = monthly_tbl$prec,
+  type = "l",
+  xlab = "Month",
+  ylab = "Precipitation (mm)",
+  xaxt = "n"
+)
+axis(1, at = 1:nrow(monthly_tbl), labels = monthly_tbl$month)
+```
+
+# 5. Screenshots Appendix
+
+```{r, echo=FALSE}
+files <- list.files("appendix", full.names = TRUE)
+knitr::include_graphics(files)
+```
